@@ -1,0 +1,24 @@
+# Ignore archives and compressed files
+*.zip
+*.rar
+*.tar
+*.tar.gz
+*.7z
+
+# Ignore input folders
+Training/
+IAM_raw/
+CVL_raw/
+
+# Ignore output folders
+__pycache__/
+outputs/
+logs/
+Preprocessed/
+CVL_Images/
+IAM_Images/
+
+
+# Ignore system files
+.DS_Store
+Thumbs.db
