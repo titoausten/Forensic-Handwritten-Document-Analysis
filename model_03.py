@@ -12,13 +12,13 @@ from collections import defaultdict
 from glob import glob
 import shutil
 import numpy as np
-from PIL import Image
+#from PIL import Image
 import fitz  
 import random
 import csv
 import pandas as pd
 import matplotlib.pyplot as plt
-import seaborn as sns
+#import seaborn as sns
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, roc_auc_score, roc_curve, auc
 import torch
@@ -28,18 +28,19 @@ from torchvision import transforms
 from torch.utils.data import Dataset, DataLoader
 from torchvision.models import resnet18
 from datetime import datetime
-import sys
-from timm import create_model
+#import sys
+#from timm import create_model
 
 #pip install timm
 
 input_dir = "Training"
 output_dir = "Preprocessed"
 image_output_root = "ImageData"
-epochsAllowed = 50
+epochsAllowed = 200
 #all available images per writer
 use_all_available_images_per_writer = True
 images_per_writer = 6
+pairs_dict = defaultdict(list)
 # ------------------------------
 # 1. Utility Functions
 # ------------------------------
@@ -122,92 +123,53 @@ class FHDAImagePairDataset(Dataset):
 
         return img1, img2, torch.tensor(label, dtype=torch.float32)
 
-def generate_pairs(image_dict, max_per_writer=10):
+def generate_pairs(image_dict_loaded, max_per_writer=10):
     """
-    Generating image pairs (same and different writers).
+    Generate image pairs (same and different writers) and log filenames.
+    Assumes each entry in image_dict[writer] is a tuple: (image_tensor, image_path)
     """
-    writers = list(image_dict.keys())
+    im_dict = image_dict_loaded
+    if pairs_dict:
+        im_dict = pairs_dict
+    
+    writers = list(im_dict.keys())
     pairs = []
     labels = []
+    pair_logs = []
 
     for writer in writers:
-        imgs = image_dict[writer]
+        imgs = im_dict[writer]
         if not use_all_available_images_per_writer:
             imgs = imgs[:images_per_writer]
-            
+
         if len(imgs) < 2:
-            # Skipping if the writer has less than 2 images
-            continue  
+            continue  # Skipping writers with fewer than 2 images
+
         # Same writer pairs
         for i in range(len(imgs)):
             for j in range(i + 1, len(imgs)):
-                pairs.append((imgs[i], imgs[j]))
+                img1, path1 = imgs[i]
+                img2, path2 = imgs[j]
+                pairs.append((img1, img2))
                 labels.append(1)
+                pair_logs.append((os.path.basename(path1), os.path.basename(path2), 1, "Same Writer"))
 
         # Different writer pairs
         for _ in range(len(imgs)):
-            other_writer = np.random.choice([w for w in writers if w != writer])
-            img1 = random.choice(imgs)
-            img2 = random.choice(image_dict[other_writer])
+            other_writer = random.choice([w for w in writers if w != writer])
+            img1, path1 = random.choice(imgs)
+            img2, path2 = random.choice(im_dict[other_writer])
             pairs.append((img1, img2))
             labels.append(0)
+            pair_logs.append((os.path.basename(path1), os.path.basename(path2), 0, "Different Writer"))
+
     print(f"Generated {len(pairs)} pairs from {len(writers)} writers")
-    save_pairs_to_csv(pairs, labels)
+    save_pairs_to_csv(pair_logs)  # ← pass logs, not just pairs and labels
     return pairs, labels
 
 # ------------------------------
 # 3. Siamese Network
 # ------------------------------
-"""
-class SiameseNetwork(nn.Module):
-    def __init__(self, model_name='resnet18', pretrained=True):
-        super(SiameseNetwork, self).__init__()
-
-        # Load model from timm without classifier head (feature extractor)
-        self.backbone = timm.create_model(model_name, pretrained=pretrained, num_classes=0)
-        self.embedding_dim = self.backbone.num_features
-
-        # Comparison (Fully connected) layer
-        self.fc = nn.Sequential(
-            nn.Linear(self.embedding_dim * 2, 512),
-            nn.ReLU(),
-            nn.Linear(512, 1),
-            nn.Sigmoid()
-        )
-
-    def forward_one(self, x):
-        return self.backbone(x)
-
-    def forward(self, x1, x2):
-        out1 = self.forward_one(x1)
-        out2 = self.forward_one(x2)
-        combined = torch.cat((out1, out2), dim=1)
-        return self.fc(combined)
-"""
-class SiameseNetworkComparison(nn.Module):
-    def __init__(self, backbone_name='resnet50'):
-        super(SiameseNetwork, self).__init__()
-
-        # Use TIMM to create the model (automatically handles all modern backbones)
-        base_model = create_model(backbone_name, pretrained=True, num_classes=0)  # num_classes=0 removes classifier
-        self.feature_extractor = base_model
-
-        feature_dim = base_model.num_features  # Get output feature dim of backbone
-
-        self.fc = nn.Sequential(
-            nn.Linear(feature_dim * 2, 512),
-            nn.ReLU(),
-            nn.Linear(512, 1)
-        )
-
-    def forward(self, x1, x2):
-        f1 = self.feature_extractor(x1)
-        f2 = self.feature_extractor(x2)
-        combined = torch.cat((f1, f2), dim=1)
-        out = self.fc(combined)
-        return out
-    
-    
 class SiameseNetwork(nn.Module):
     def __init__(self):
         super(SiameseNetwork, self).__init__()
@@ -243,7 +205,8 @@ def preprocess_all_images(image_root, output_dir="Preprocessed"):
     os.makedirs(output_dir, exist_ok=True)
     print(f"Created output directory: {output_dir}")
 
-    image_dict = {}
+    image_dict = defaultdict(list)
+    pairs_dict = defaultdict(list)
 
     for writer_folder in os.listdir(image_root):  
         full_folder_path = os.path.join(image_root, writer_folder)
@@ -260,9 +223,6 @@ def preprocess_all_images(image_root, output_dir="Preprocessed"):
                 writer_id = img_file.split('_')[0] + '_' + img_file.split('_')[1]
             else:
                 writer_id = writer_folder
-                
-            if writer_id not in image_dict:
-                image_dict[writer_id] = []
 
             img_path = os.path.join(full_folder_path, img_file)
             img = cv2.imread(img_path)
@@ -283,8 +243,9 @@ def preprocess_all_images(image_root, output_dir="Preprocessed"):
             cv2.imwrite(output_path, processed)
 
             image_dict[writer_id].append(processed)
+            pairs_dict[writer_id].append((processed, output_path))
 
-    return image_dict
+    return image_dict, pairs_dict
 
 
 def further_style_preprocessing(image):
@@ -394,7 +355,7 @@ def reorganize_cvl_dataset(source_CVL_dir='CVL_raw', output_CVL_dir='CVL_Images'
     files = [f for f in os.listdir(source_CVL_dir) if f.endswith(('.png', '.jpg', '.jpeg', '.tif', '.tiff'))]
 
     for file in files:
-        # Extract writer ID from filename (e.g., 0196-1-cropped.tiff => 0196)
+        # Extracting writer ID from filename (e.g., 0196-1-cropped.tiff => 0196)
         parts = file.split('-')
         if len(parts) > 1:
 
@@ -478,32 +439,13 @@ def save_results_to_csv(accuracy, auc, dataset_name="IAM + Handwriting", model_n
         print(f"Failed to save results: {e}")
 
 
-def save_pairs_to_csv(pairs, labels, filename="pairs_log.csv"):
+def save_pairs_to_csv(pair_logs, filename="pairs_log.csv"):
     """
-    Saving generated image pairs and labels to a CSV file in the same directory as the script.
-
-    Args:
-        pairs (list): List of image path pairs.
-        labels (list): List of labels (1 for same writer, 0 for different writers).
-        filename (str): Name of the CSV file (default is pairs_log.csv).
+    Saving image pair filenames and labels to CSV for traceability.
     """
-    # Get current script directory
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    csv_path = os.path.join(script_dir, filename)
-
-    with open(csv_path, mode='w', newline='', encoding='utf-8') as file:
-        writer = csv.writer(file)
-        writer.writerow(['Image1', 'Image2', 'Label', 'LabelMeaning'])
-
-        for (img1, img2), label in zip(pairs, labels):
-            # If image is a path, keep it as is; otherwise try to extract .filename
-            img1_path = img1 if isinstance(img1, str) else getattr(img1, 'filename', 'unknown')
-            img2_path = img2 if isinstance(img2, str) else getattr(img2, 'filename', 'unknown')
-            label_meaning = "Same Writer" if label == 1 else "Different Writers"
-            writer.writerow([img1_path, img2_path, label, label_meaning])
-
-
-    print(f"Saved {len(pairs)} pairs to {csv_path}")
+    df = pd.DataFrame(pair_logs, columns=["Image1", "Image2", "Label", "LabelMeaning"])
+    df.to_csv(filename, index=False)
+    print(f"Pair logs saved to {filename}")
 
 
 def visualize_and_show_pair(pairs, labels, num_samples=10):
@@ -726,7 +668,7 @@ def plot_model_comparisons(results):
     plt.figure(figsize=(8, 6))
     for backbone, roc in zip(backbones, results["ROC"]):
         fpr, tpr = roc
-        auc_score = roc_auc_score  
+        #auc_score = roc_auc_score  
         plt.plot(fpr, tpr, label=f"{backbone}")
     plt.plot([0, 1], [0, 1], "k--", label="Random")
     plt.title("ROC Curve Comparison")
@@ -737,59 +679,6 @@ def plot_model_comparisons(results):
     plt.tight_layout()
     plt.show()
 
-
-
-def train_and_evaluate_models_old(backbone_list, image_pairs, labels, transform, device):
-    results = {
-        "Backbone": [],
-        "Train Accuracy": [],
-        "Train AUC": [],
-        "Loss Curve": [],
-        "Acc Curve": []
-    }
-
-    # Train-test split
-    train_pairs, test_pairs, train_labels, test_labels = train_test_split(
-        image_pairs, labels, test_size=0.2, random_state=42)
-
-    # Optionally limiting data size for speed 
-    #train_pairs, train_labels = train_pairs[:1000], train_labels[:1000]
-    #test_pairs, test_labels = test_pairs[:300], test_labels[:300]
-
-    # Dataset and loader setup
-    train_dataset = FHDAImagePairDataset(train_pairs, train_labels, transform)
-    test_dataset = FHDAImagePairDataset(test_pairs, test_labels, transform)
-
-    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=8)
-
-    for backbone in backbone_list:
-        print(f"\nTraining with backbone: {backbone}")
-        model = SiameseNetwork(backbone_name=backbone).to(device)
-
-        criterion = nn.BCEWithLogitsLoss()
-        optimizer = optim.Adam(model.parameters(), lr=1e-4)
-
-        train_losses, train_accuracies = train_siamese(
-            model, train_loader, criterion, optimizer, device, num_epochs=5)
-
-        # Evaluate
-        acc, auc = evaluate_model(
-            model, test_loader, device,
-            export_csv_path=f"predictions_{backbone}.csv")
-
-        # Save results
-        results["Backbone"].append(backbone)
-        results["Train Accuracy"].append(acc)
-        results["Train AUC"].append(auc)
-        results["Loss Curve"].append(train_losses)
-        results["Acc Curve"].append(train_accuracies)
-
-    return results
-    
-
-    
- 
     
 def main():
     # Step 1: Load PDFs and convert to images
@@ -805,15 +694,15 @@ def main():
     print("Converting PDFs to images...")
     convert_all_pdfs_to_images(input_dir, image_output_root)
     
-    image_dict = preprocess_all_images(image_output_root)
+    image_dict, pairs_dict = preprocess_all_images(image_output_root)
     print(f"Images preprocessed {[len(v) for v in image_dict.values()]}")
-    for writer_id, images in image_dict.items():
-        print(f"Writer ID: {writer_id} - Number of Images: {len(images)}")
+    
+    #for writer_id, images in image_dict.items():
+        #print(f"Writer ID: {writer_id} - Number of Images: {len(images)}")
      
-    # Stop further execution
-    sys.exit("Stopped execution after examining image_dict.")
 
     """
+    # For IAM HAndwriting Dataset
     if not os.path.exists('IAM_raw'):
         raise FileNotFoundError("The 'IAM_raw' folder was not found. Please make sure it exists in the working directory.")
     
@@ -823,7 +712,7 @@ def main():
     
     image_dict_initial = load_iam_data('IAM_Images')
     
-    image_dict = preprocess_all_images('IAM_Images', 'Preprocessed')
+    image_dict, pairs_dict = preprocess_all_images('IAM_Images', 'Preprocessed')
     print(f"Images preprocessed {[len(v) for v in image_dict.values()]}")
     
 
@@ -835,13 +724,14 @@ def main():
     """
     
     """
+    # For CVL Dataset
     if not os.path.exists('CVL_raw'):
         raise FileNotFoundError("The 'CVL_raw' folder was not found. Please make sure it exists in the working directory.")
     
     print("Loading and preprocessing CVL Handwriting images...")
     reorganize_cvl_dataset('CVL_raw', 'CVL_Images')
     
-    image_dict = preprocess_all_images('CVL_Images', 'Preprocessed')
+    image_dict, pairs_dict = preprocess_all_images('CVL_Images', 'Preprocessed')
     print(f"Images preprocessed {[len(v) for v in image_dict.values()]}")
     
 
@@ -854,7 +744,7 @@ def main():
     
     # Step 2: Generate image pairs
     print("Generating image pairs...")
-    pairs, labels = generate_pairs(image_dict, images_per_writer)
+    pairs, labels = generate_pairs(pairs_dict, images_per_writer)
     print(f"Generated {len(pairs)} pairs")
     
     #Showing about 10 random pairs to inspect preprocessing results
@@ -866,7 +756,7 @@ def main():
     
     #In production version we shall comment line below as it only limits to 1000 data to make it train faster
     #train_pairs, train_labels = train_pairs[:1000], train_labels[:1000]
-
+    #test_pairs, test_labels = test_pairs[:300], test_labels[:300]
 
     # Step 4: Preparing the datasets
     transform = transforms.Compose([
@@ -898,64 +788,15 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
     
     
-    # Step 7: Train the model
-    #train_siamese(model, train_loader, criterion, optimizer, device, num_epochs=epochsAllowed)
-    
-    # Train
-    train_losses, train_accuracies = train_siamese(model, train_loader, criterion, optimizer, device, num_epochs=10)
+    # Step 7: Training the model
+    train_losses, train_accuracies = train_siamese(model, train_loader, criterion, optimizer, device, num_epochs=epochsAllowed)
     
     # Plot training performance
     plot_training_curves(train_losses, train_accuracies)
     
     # Evaluate
-    evaluate_model(model, train_loader, device, export_csv_path="predictions.csv")
+    evaluate_model(model, test_loader, device, export_csv_path="predictions.csv")
 
-
-
-    """
-    backbone_list = [
-    "resnet18",
-    "resnet26d",
-    "res2net50_26w_4s",
-    "resnext50_32x4d",
-    "tf_efficientnet_b0"
-    ]
-
-
-    results = {
-        "Backbone": [],
-        "Train Accuracy": [],
-        "Train AUC": [],
-        "Loss Curve": [],
-        "Acc Curve": [],
-        "ROC": []
-    }
-    
-    for backbone in backbone_list:
-       print(f"\nTraining with backbone: {backbone}")
-       model = SiameseNetwork(backbone_name=backbone).to(device)
-
-       criterion = nn.BCEWithLogitsLoss()
-       optimizer = optim.Adam(model.parameters(), lr=1e-4)
-
-       train_losses, train_accuracies = train_siamese(
-           model, train_loader, criterion, optimizer, device, num_epochs=epochsAllowed)
-
-       acc, auc, roc_data = evaluate_current_model(
-           model, test_loader, device,
-           export_csv_path=f"predictions_{backbone}.csv")
-
-       results["Backbone"].append(backbone)
-       results["Train Accuracy"].append(acc)
-       results["Train AUC"].append(auc)
-       results["Loss Curve"].append(train_losses)
-       results["Acc Curve"].append(train_accuracies)
-       results["ROC"].append(roc_data)
-       
-    #results = train_and_evaluate_models(backbones_to_test, pairs, labels, transform, device)
-    plot_model_comparisons(results)
-    
-    """
 
 if __name__ == "__main__":
     main()
