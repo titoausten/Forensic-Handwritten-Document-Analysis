@@ -28,13 +28,15 @@ from torchvision import transforms
 from torch.utils.data import Dataset, DataLoader
 from torchvision.models import resnet18
 from datetime import datetime
+import sys
+from timm import create_model
 
 #pip install timm
 
 input_dir = "Training"
 output_dir = "Preprocessed"
 image_output_root = "ImageData"
-epochsAllowed = 5
+epochsAllowed = 50
 #all available images per writer
 use_all_available_images_per_writer = True
 images_per_writer = 6
@@ -182,7 +184,30 @@ class SiameseNetwork(nn.Module):
         combined = torch.cat((out1, out2), dim=1)
         return self.fc(combined)
 """
+class SiameseNetworkComparison(nn.Module):
+    def __init__(self, backbone_name='resnet50'):
+        super(SiameseNetwork, self).__init__()
 
+        # Use TIMM to create the model (automatically handles all modern backbones)
+        base_model = create_model(backbone_name, pretrained=True, num_classes=0)  # num_classes=0 removes classifier
+        self.feature_extractor = base_model
+
+        feature_dim = base_model.num_features  # Get output feature dim of backbone
+
+        self.fc = nn.Sequential(
+            nn.Linear(feature_dim * 2, 512),
+            nn.ReLU(),
+            nn.Linear(512, 1)
+        )
+
+    def forward(self, x1, x2):
+        f1 = self.feature_extractor(x1)
+        f2 = self.feature_extractor(x2)
+        combined = torch.cat((f1, f2), dim=1)
+        out = self.fc(combined)
+        return out
+    
+    
 class SiameseNetwork(nn.Module):
     def __init__(self):
         super(SiameseNetwork, self).__init__()
@@ -220,7 +245,7 @@ def preprocess_all_images(image_root, output_dir="Preprocessed"):
 
     image_dict = {}
 
-    for writer_folder in os.listdir(image_root):  # e.g., Paper_images, Tablet_images
+    for writer_folder in os.listdir(image_root):  
         full_folder_path = os.path.join(image_root, writer_folder)
         if not os.path.isdir(full_folder_path):
             continue
@@ -230,7 +255,12 @@ def preprocess_all_images(image_root, output_dir="Preprocessed"):
                 continue
 
             # using folder name as writer ID
-            writer_id = writer_folder  
+            writer_id = writer_folder
+            if "tablet_images" in writer_folder.lower() or "paper_images" in writer_folder.lower():
+                writer_id = img_file.split('_')[0] + '_' + img_file.split('_')[1]
+            else:
+                writer_id = writer_folder
+                
             if writer_id not in image_dict:
                 image_dict[writer_id] = []
 
@@ -445,7 +475,7 @@ def save_results_to_csv(accuracy, auc, dataset_name="IAM + Handwriting", model_n
 
         print(f"Results saved to {output_file}")
     except Exception as e:
-        print(f"[!] Failed to save results: {e}")
+        print(f"Failed to save results: {e}")
 
 
 def save_pairs_to_csv(pairs, labels, filename="pairs_log.csv"):
@@ -567,6 +597,37 @@ def evaluate_model(model, dataloader, device, export_csv_path=None):
     return acc, roc_auc
 
 
+def evaluate_current_model(model, dataloader, device, export_csv_path=None):
+    model.eval()
+    all_labels = []
+    all_outputs = []
+
+    with torch.no_grad():
+        for img1, img2, labels in dataloader:
+            img1, img2 = img1.to(device), img2.to(device)
+            outputs = model(img1, img2).squeeze(1)
+            probs = torch.sigmoid(outputs).cpu().numpy()
+            all_outputs.extend(probs)
+            all_labels.extend(labels.numpy())
+
+    all_labels = np.array(all_labels)
+    all_outputs = np.array(all_outputs)
+
+    preds = (all_outputs > 0.5).astype(int)
+    acc = accuracy_score(all_labels, preds)
+    auc_score = roc_auc_score(all_labels, all_outputs)
+    fpr, tpr, _ = roc_curve(all_labels, all_outputs)
+
+    if export_csv_path:
+        pd.DataFrame({
+            "Label": all_labels,
+            "Prob": all_outputs,
+            "Pred": preds
+        }).to_csv(export_csv_path, index=False)
+
+    return acc, auc_score, (fpr, tpr)
+
+
 def plot_roc_curve(true_labels, pred_probs):
     fpr, tpr, _ = roc_curve(true_labels, pred_probs)
     roc_auc = auc(fpr, tpr)
@@ -606,11 +667,133 @@ def plot_training_curves(losses, accuracies):
     plt.tight_layout()
     plt.show()
 
+
+def plot_model_comparisons_old(results):
+    plt.figure(figsize=(12, 5))
+
+    # Accuracy bar chart
+    plt.subplot(1, 2, 1)
+    plt.bar(results["Backbone"], results["Train Accuracy"], color='skyblue')
+    plt.title("Test Accuracy by Backbone")
+    plt.ylabel("Accuracy")
+    plt.xticks(rotation=30)
+
+    # ROC AUC bar chart
+    plt.subplot(1, 2, 2)
+    plt.bar(results["Backbone"], results["Train AUC"], color='lightgreen')
+    plt.title("ROC AUC by Backbone")
+    plt.ylabel("AUC Score")
+    plt.xticks(rotation=30)
+
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_model_comparisons(results):
+    import matplotlib.pyplot as plt
+
+    backbones = results["Backbone"]
+
+    # Accuracy and AUC Bar Charts 
+    plt.figure(figsize=(12, 5))
+    plt.subplot(1, 2, 1)
+    plt.bar(backbones, results["Train Accuracy"], color='skyblue')
+    plt.title("Test Accuracy by Backbone")
+    plt.ylabel("Accuracy")
+    plt.xticks(rotation=30)
+
+    plt.subplot(1, 2, 2)
+    plt.bar(backbones, results["Train AUC"], color='lightgreen')
+    plt.title("ROC AUC by Backbone")
+    plt.ylabel("AUC Score")
+    plt.xticks(rotation=30)
+    plt.tight_layout()
+    plt.show()
+
+    # Combined Training Loss Curve 
+    plt.figure(figsize=(8, 6))
+    for backbone, loss_curve in zip(backbones, results["Loss Curve"]):
+        plt.plot(loss_curve, label=backbone)
+    plt.title("Training Loss Curve Comparison")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+    # Combined ROC Curve 
+    plt.figure(figsize=(8, 6))
+    for backbone, roc in zip(backbones, results["ROC"]):
+        fpr, tpr = roc
+        auc_score = roc_auc_score  
+        plt.plot(fpr, tpr, label=f"{backbone}")
+    plt.plot([0, 1], [0, 1], "k--", label="Random")
+    plt.title("ROC Curve Comparison")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+
+
+def train_and_evaluate_models_old(backbone_list, image_pairs, labels, transform, device):
+    results = {
+        "Backbone": [],
+        "Train Accuracy": [],
+        "Train AUC": [],
+        "Loss Curve": [],
+        "Acc Curve": []
+    }
+
+    # Train-test split
+    train_pairs, test_pairs, train_labels, test_labels = train_test_split(
+        image_pairs, labels, test_size=0.2, random_state=42)
+
+    # Optionally limiting data size for speed 
+    #train_pairs, train_labels = train_pairs[:1000], train_labels[:1000]
+    #test_pairs, test_labels = test_pairs[:300], test_labels[:300]
+
+    # Dataset and loader setup
+    train_dataset = FHDAImagePairDataset(train_pairs, train_labels, transform)
+    test_dataset = FHDAImagePairDataset(test_pairs, test_labels, transform)
+
+    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=8)
+
+    for backbone in backbone_list:
+        print(f"\nTraining with backbone: {backbone}")
+        model = SiameseNetwork(backbone_name=backbone).to(device)
+
+        criterion = nn.BCEWithLogitsLoss()
+        optimizer = optim.Adam(model.parameters(), lr=1e-4)
+
+        train_losses, train_accuracies = train_siamese(
+            model, train_loader, criterion, optimizer, device, num_epochs=5)
+
+        # Evaluate
+        acc, auc = evaluate_model(
+            model, test_loader, device,
+            export_csv_path=f"predictions_{backbone}.csv")
+
+        # Save results
+        results["Backbone"].append(backbone)
+        results["Train Accuracy"].append(acc)
+        results["Train AUC"].append(auc)
+        results["Loss Curve"].append(train_losses)
+        results["Acc Curve"].append(train_accuracies)
+
+    return results
     
+
+    
+ 
     
 def main():
     # Step 1: Load PDFs and convert to images
-    """
+    
     print("Loading and preprocessing images...")
     if not os.path.exists(input_dir):
         raise FileNotFoundError("The 'Training' folder was not found. Please make sure it exists in the working directory.")
@@ -624,7 +807,12 @@ def main():
     
     image_dict = preprocess_all_images(image_output_root)
     print(f"Images preprocessed {[len(v) for v in image_dict.values()]}")
-    """
+    for writer_id, images in image_dict.items():
+        print(f"Writer ID: {writer_id} - Number of Images: {len(images)}")
+     
+    # Stop further execution
+    sys.exit("Stopped execution after examining image_dict.")
+
     """
     if not os.path.exists('IAM_raw'):
         raise FileNotFoundError("The 'IAM_raw' folder was not found. Please make sure it exists in the working directory.")
@@ -646,6 +834,7 @@ def main():
     image_dict.update(iam_dict_prefixed)
     """
     
+    """
     if not os.path.exists('CVL_raw'):
         raise FileNotFoundError("The 'CVL_raw' folder was not found. Please make sure it exists in the working directory.")
     
@@ -661,6 +850,7 @@ def main():
     
     # Merge both datasets
     image_dict.update(iam_dict_prefixed)
+    """
     
     # Step 2: Generate image pairs
     print("Generating image pairs...")
@@ -668,18 +858,17 @@ def main():
     print(f"Generated {len(pairs)} pairs")
     
     #Showing about 10 random pairs to inspect preprocessing results
-    visualize_and_show_pair(pairs, labels, num_samples=10)
+    #visualize_and_show_pair(pairs, labels, num_samples=10)
     
-
     # Step 3: Train/test split
     train_pairs, test_pairs, train_labels, test_labels = train_test_split(
         pairs, labels, test_size=0.2, random_state=42)
     
     #In production version we shall comment line below as it only limits to 1000 data to make it train faster
-    train_pairs, train_labels = train_pairs[:1000], train_labels[:1000]
+    #train_pairs, train_labels = train_pairs[:1000], train_labels[:1000]
 
 
-    # Step 4: Prepare datasets
+    # Step 4: Preparing the datasets
     transform = transforms.Compose([
         transforms.ToPILImage(),
         transforms.Resize((224, 224)),
@@ -693,23 +882,24 @@ def main():
     ])
     
     
-    # Step 5: Create dataset and dataloader
+    # Step 5: Creating dataset and dataloader
     train_dataset = FHDAImagePairDataset(train_pairs, train_labels, transform)
-    #test_dataset = FHDAImagePairDataset(test_pairs, test_labels, transform)
+    test_dataset = FHDAImagePairDataset(test_pairs, test_labels, transform)
 
     train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
-    #test_loader = DataLoader(test_dataset, batch_size=8)
+    test_loader = DataLoader(test_dataset, batch_size=8)
 
 
-    # Step 6: Initialize and train model 
+    # Step 6: Initializing and training the model 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = SiameseNetwork().to(device)
     
     criterion = nn.BCEWithLogitsLoss()
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
     
-    # Step 7: Train the model using your function
-    train_siamese(model, train_loader, criterion, optimizer, device, num_epochs=epochsAllowed)
+    
+    # Step 7: Train the model
+    #train_siamese(model, train_loader, criterion, optimizer, device, num_epochs=epochsAllowed)
     
     # Train
     train_losses, train_accuracies = train_siamese(model, train_loader, criterion, optimizer, device, num_epochs=10)
@@ -720,52 +910,52 @@ def main():
     # Evaluate
     evaluate_model(model, train_loader, device, export_csv_path="predictions.csv")
 
+
+
     """
-    print("Training model...")
-    # To increase/decrease epochs then change epochsAllowed value
-    for epoch in range(epochsAllowed):  
-        #print(f"Epoch {epoch+1} starting...")
-        model.train()
-        total_loss = 0
-        for x1, x2, y in train_loader:
-            x1, x2, y = x1.to(device), x2.to(device), y.to(device)
-            optimizer.zero_grad()
-            #outputs = model(x1, x2).squeeze()
-            outputs = model(x1, x2)
-            outputs = outputs.view(-1)  # Ensuring output is 1D
-            y = y.view(-1)   
-            loss = criterion(outputs, y)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-            #print(f"Epoch {epoch+1} finished.")
-        print(f"Epoch {epoch+1} - Loss: {total_loss / len(train_loader):.4f}")
+    backbone_list = [
+    "resnet18",
+    "resnet26d",
+    "res2net50_26w_4s",
+    "resnext50_32x4d",
+    "tf_efficientnet_b0"
+    ]
 
-    # Step 6: Evaluation
-    model.eval()
-    preds = []
-    gts = []
-    with torch.no_grad():
-        for x1, x2, y in test_loader:
-            x1, x2 = x1.to(device), x2.to(device)
-            outputs = model(x1, x2).squeeze()
-            pred = torch.sigmoid(outputs).cpu().numpy()
-            preds.extend(pred)
-            gts.extend(y.numpy())
 
-    bin_preds = [1 if p > 0.5 else 0 for p in preds]
-    acc = accuracy_score(gts, bin_preds)
-    auc = roc_auc_score(gts, preds)
-    print(f"\nEvaluation - Accuracy: {acc:.4f} | AUC: {auc:.4f}")
-    save_results_to_csv(
-    acc,
-    auc,
-    dataset_name="IAM + Handwriting",
-    model_name="Siamese_ResNet18",
-    epochs=epochsAllowed,
-    notes="Enabled enhanced preprocessing")
+    results = {
+        "Backbone": [],
+        "Train Accuracy": [],
+        "Train AUC": [],
+        "Loss Curve": [],
+        "Acc Curve": [],
+        "ROC": []
+    }
+    
+    for backbone in backbone_list:
+       print(f"\nTraining with backbone: {backbone}")
+       model = SiameseNetwork(backbone_name=backbone).to(device)
+
+       criterion = nn.BCEWithLogitsLoss()
+       optimizer = optim.Adam(model.parameters(), lr=1e-4)
+
+       train_losses, train_accuracies = train_siamese(
+           model, train_loader, criterion, optimizer, device, num_epochs=epochsAllowed)
+
+       acc, auc, roc_data = evaluate_current_model(
+           model, test_loader, device,
+           export_csv_path=f"predictions_{backbone}.csv")
+
+       results["Backbone"].append(backbone)
+       results["Train Accuracy"].append(acc)
+       results["Train AUC"].append(auc)
+       results["Loss Curve"].append(train_losses)
+       results["Acc Curve"].append(train_accuracies)
+       results["ROC"].append(roc_data)
+       
+    #results = train_and_evaluate_models(backbones_to_test, pairs, labels, transform, device)
+    plot_model_comparisons(results)
+    
     """
-
 
 if __name__ == "__main__":
     main()
