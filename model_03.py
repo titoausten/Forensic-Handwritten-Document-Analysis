@@ -36,11 +36,13 @@ from datetime import datetime
 input_dir = "Training"
 output_dir = "Preprocessed"
 image_output_root = "ImageData"
-epochsAllowed = 200
+epochsAllowed = 80
 #all available images per writer
 use_all_available_images_per_writer = True
-images_per_writer = 6
+images_per_writer = 10
 pairs_dict = defaultdict(list)
+best_val_acc = 0.0
+best_model_path = "best_model.pth"
 # ------------------------------
 # 1. Utility Functions
 # ------------------------------
@@ -474,6 +476,7 @@ def train_siamese(model, dataloader, criterion, optimizer, device, num_epochs=ep
     model.to(device)
     train_losses = []
     train_accuracies = []
+    best_acc = 0.0
 
     for epoch in range(num_epochs):
         model.train()
@@ -502,11 +505,19 @@ def train_siamese(model, dataloader, criterion, optimizer, device, num_epochs=ep
 
         print(f"Epoch [{epoch+1}/{num_epochs}] - Loss: {avg_loss:.4f} - Accuracy: {accuracy:.4f}")
 
+        # Save best model based on training accuracy
+        if accuracy > best_acc:
+            best_acc = accuracy
+            torch.save(model.state_dict(), best_model_path)
+            #print(f"Best model updated at Epoch {epoch+1} with accuracy: {accuracy:.4f}")
+        best_val_acc = best_acc
+    print(f"Training complete. Best accuracy: {best_acc:.4f}")
+
     return train_losses, train_accuracies
 
 
 def evaluate_model(model, dataloader, device, export_csv_path=None):
-    model.eval()
+    #model.eval()
     preds_list = []
     labels_list = []
     probs_list = []
@@ -540,7 +551,7 @@ def evaluate_model(model, dataloader, device, export_csv_path=None):
 
 
 def evaluate_current_model(model, dataloader, device, export_csv_path=None):
-    model.eval()
+    #model.eval()
     all_labels = []
     all_outputs = []
 
@@ -791,8 +802,13 @@ def main():
     # Step 7: Training the model
     train_losses, train_accuracies = train_siamese(model, train_loader, criterion, optimizer, device, num_epochs=epochsAllowed)
     
-    # Plot training performance
+    # Plotting training performance
     plot_training_curves(train_losses, train_accuracies)
+    
+    # Loading the best model for evaluation
+    model.load_state_dict(torch.load("best_model.pth"))
+    model.eval()
+    print("Loaded best model for evaluation.")
     
     # Evaluate
     evaluate_model(model, test_loader, device, export_csv_path="predictions.csv")
