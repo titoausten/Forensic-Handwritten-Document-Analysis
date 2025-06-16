@@ -1,0 +1,12 @@
+ImageData/
+Training/
+Preprocessed/
+IAM_raw/
+IAM_Images/
+CVL_raw/
+CVL_Images/
+*.zip
+*.rar
+*.tar
+*.csv
+*.pth
